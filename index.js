@@ -1,59 +1,90 @@
 /**
- * Hofer / ALDI multi-country checker
+ * index.js - Hofer / ALDI multi-country checker (improved)
  *
- * - Checks 6 countries (AT, CH, HU, DE, SI, IT)
- * - Discovers date-PLP links (like /d.08-12-2025.html) from the listing page
- * - Fetch-first, Playwright fallback
- * - Localized keyword matching to extract counts
+ * - Fetch-first, Playwright fallback for dynamic pages
+ * - Per-country keyword map tuned for AT/CH/HU/DE/SI/IT
+ * - Normalizes numbers with dots/commas/spaces
+ * - Supports ?format=txt or Accept: text/plain
+ * - Optional SCRAPER_SECRET header check
  *
- * Configure:
- * - Optionally set SCRAPER_SECRET env var and call with header x-scraper-secret
- * - PORT from env or 3000
+ * Requirements:
+ * - Node 18+ recommended (global fetch available)
+ * - Playwright optional: if installed and available, the script will use it for rendering
  */
 
 const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// attempt to require playwright (optional)
 let playwrightChromium = null;
 try {
-  // optional: Playwright may not be installed or available in some environments
   playwrightChromium = require('playwright').chromium;
+  console.log('Playwright available.');
 } catch (e) {
   console.log('Playwright not available:', e.message ? e.message.split('\n')[0] : e);
 }
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (_req, res) => res.send('Hofer checker alive'));
-
-// Countries config: base, listing path to discover PLPs, keywords to search for counts
+// Countries config
 const COUNTRIES = [
-  { code: 'AT', base: 'https://www.hofer.at', listingPath: '/de/angebote', keywords: ['Aktionsartikel', 'Aktionsartikel gefunden', 'Aktionsartikel gefunden'] },
-  { code: 'CH', base: 'https://www.aldi-suisse.ch', listingPath: '/de/aktionen-und-angebote', keywords: ['Aktionsartikel', 'Aktionsartikel gefunden'] },
-  { code: 'HU', base: 'https://www.aldi.hu', listingPath: '/hu/ajanlatok', keywords: ['ajánlat', 'Ajánlat', 'ajánlatok'] },
-  { code: 'DE', base: 'https://www.aldi-sued.de', listingPath: '/de/angebote', keywords: ['Angebote', 'Angebote gefunden'] },
-  { code: 'SI', base: 'https://www.hofer.si', listingPath: '/sl/ponudba', keywords: ['ponudba', 'najdenih izdelkov', 'izdelkov'] },
-  { code: 'IT', base: 'https://www.aldi.it', listingPath: '/it/offerte-settimanali', keywords: ['offerta', 'Prodotto in offerta', 'offerte'] }
+  { code: 'AT', base: 'https://www.hofer.at', listingPath: '/de/angebote' },
+  { code: 'CH', base: 'https://www.aldi-suisse.ch', listingPath: '/de/aktionen-und-angebote' },
+  { code: 'HU', base: 'https://www.aldi.hu', listingPath: '/hu/ajanlatok' },
+  { code: 'DE', base: 'https://www.aldi-sued.de', listingPath: '/de/angebote' },
+  { code: 'SI', base: 'https://www.hofer.si', listingPath: '/sl/ponudba' },
+  { code: 'IT', base: 'https://www.aldi.it', listingPath: '/it/offerte-settimanali' }
 ];
 
-/* helpers */
+// per-country keywords (expanded / localized)
+const KEYWORD_MAP = {
+  AT: ['Aktionsartikel', 'Aktionsartikel gefunden', 'Aktionsartikel gefunden', 'Aktionsartikel'],
+  CH: ['Aktionsartikel', 'Aktionsartikel gefunden', 'Aktionsartikel'],
+  HU: ['ajánlat', 'ajánlatok', 'ajánlat található', 'ajánlatok találhatók', 'ajánlatok talál'],
+  DE: ['Angebot', 'Angebote', 'Angebote gefunden', 'Angebot gefunden', 'Angebote gefunden'],
+  SI: ['ponudba', 'najdenih', 'najdenih izdelkov', 'izdelkov', 'najdenih izdelkov posebne ponudbe'],
+  IT: ['offerta', 'offerte', 'Prodotto in offerta', 'offerte trovate']
+};
 
-// simple fetch using global fetch (Node 18+)
+// domains we should always attempt Playwright rendering for (problematic / JS-heavy)
+const ALWAYS_RENDER_DOMAINS = ['aldi.hu', 'aldi-sued.de', 'hofer.si'];
+
+/* ---------- helpers ---------- */
+
+function escapeRegex(s = '') {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// normalize numbers such as "1.234", "1,234", "1 234", "1 234"
+function normalizeNumberString(numStr) {
+  if (!numStr) return null;
+  // replace non-breaking spaces with normal space
+  const cleanedSpaces = numStr.replace(/\u00A0|\u202F/g, ' ');
+  // remove thousand separators: dot, comma or space when followed by three digits
+  const removedThousands = cleanedSpaces.replace(/(?<=\d)[\.\, ](?=\d{3}\b)/g, '');
+  // remove other non-digit characters except leading minus
+  const digitsOnly = removedThousands.replace(/[^\d\-]/g, '');
+  if (!digitsOnly) return null;
+  const v = parseInt(digitsOnly, 10);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Try to fetch HTML with global fetch (Node 18+). Returns text or null.
 async function tryFetchHtml(url, timeout = 20000) {
+  if (typeof fetch !== 'function') return null;
   try {
-    if (typeof fetch !== 'function') return null;
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
-    const r = await fetch(url, {
+    const resp = await fetch(url, {
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Accept-Language': 'de-DE,de;q=0.9'
       },
       signal: controller.signal
     });
     clearTimeout(id);
-    if (!r.ok) return null;
-    const text = await r.text();
+    if (!resp.ok) return null;
+    const text = await resp.text();
     return text;
   } catch (e) {
     // console.log('fetch error', url, e && e.message ? e.message : e);
@@ -61,102 +92,126 @@ async function tryFetchHtml(url, timeout = 20000) {
   }
 }
 
+// extract anchors (href+text) from HTML
 function extractAnchorsFromHtml(html) {
   const hrefs = [];
   if (!html) return hrefs;
-  try {
-    const re = /<a\s+[^>]*href=(["'])(.*?)\1[^>]*>(.*?)<\/a>/gi;
-    let m;
-    while ((m = re.exec(html)) !== null) {
-      hrefs.push({ href: m[2], text: (m[3] || '').replace(/<[^>]*>/g, '').trim() });
-    }
-  } catch (e) {}
+  const re = /<a\s+[^>]*href=(["'])(.*?)\1[^>]*>(.*?)<\/a>/gsi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    hrefs.push({ href: m[2], text: (m[3] || '').replace(/<[^>]*>/g, '').trim() });
+  }
   return hrefs;
 }
 
-// raw HTML scan for common date PLP pattern: /d.08-12-2025.html
+// extract explicit date-PLP patterns like /d.08-12-2025.html
 function extractDatePlpLinksFromHtml(html, base) {
   const set = new Set();
   if (!html) return set;
-  try {
-    const re = /(?:href=)?["']?([^"'\s>]*\/d\.\d{2}-\d{2}-\d{4}\.html)["']?/gi;
-    let m;
-    while ((m = re.exec(html)) !== null) {
-      const href = m[1];
-      if (!href) continue;
-      const abs = href.startsWith('http') ? href : new URL(href, base).toString();
-      set.add(abs.split('#')[0].split('?')[0]);
-    }
-  } catch (e) {}
+  const re = /(?:href=)?["']?([^"'\s>]*\/d\.\d{2}-\d{2}-\d{4}\.html)["']?/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const href = m[1];
+    if (!href) continue;
+    const abs = href.startsWith('http') ? href : new URL(href, base).toString();
+    set.add(abs.split('#')[0].split('?')[0]);
+  }
   return set;
 }
 
-function normalizeAndCollect(href, base, set, listingKeywords = []) {
+// normalize and collect likely PLP URLs (date pages or listing-like)
+function normalizeAndCollect(href, base, set, listingPath = '') {
   if (!href) return;
   if (href.startsWith('javascript:')) return;
+  // skip mailto
+  if (href.startsWith('mailto:')) return;
   const isInternal = href.startsWith('/') || href.includes(new URL(base).hostname);
   if (!isInternal) return;
-  // gather if it contains date-PLP hint or listing keywords
   const looksLikePlp = /\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(href) || href.toLowerCase().includes('/d.');
-  const containsListingKeyword = listingKeywords.some(kw => (href || '').toLowerCase().includes(kw.toLowerCase()));
-  if (looksLikePlp || containsListingKeyword || href.toLowerCase().includes('/angebote') || href.toLowerCase().includes('/offerte')) {
+  const containsListing = listingPath && href.toLowerCase().includes(listingPath.toLowerCase());
+  if (looksLikePlp || containsListing || href.toLowerCase().includes('/angebote') || href.toLowerCase().includes('/offerte') || href.toLowerCase().includes('/anj')) {
     const abs = href.startsWith('http') ? href : new URL(href, base).toString();
     set.add(abs.split('#')[0].split('?')[0]);
   }
 }
 
-function escapeRegex(s = '') {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// try to extract count from text using a list of localized keywords
-function extractCountFromText(text, keywords = []) {
+// improved extraction from text using keywords + normalization
+function extractCountFromTextImproved(text, keywords = []) {
   if (!text) return null;
-  // normalize whitespace
-  const normalized = text.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ');
-  // First try patterns: number ... keyword
-  for (const kw of keywords) {
+  const normalized = text.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // try patterns number <-> keyword
+  for (const kw of (keywords || [])) {
     if (!kw) continue;
-    const re1 = new RegExp('(\\d{1,6})[^\\d\\n\\r]{0,30}' + escapeRegex(kw), 'i');
+    const re1 = new RegExp('(\\d{1,6}[\\d\\.,\\u00A0\\u202F]*)[^\\d\\n\\r]{0,40}' + escapeRegex(kw), 'i');
     const m1 = normalized.match(re1);
-    if (m1 && m1[1]) return parseInt(m1[1], 10);
-    // keyword ... number
-    const re2 = new RegExp(escapeRegex(kw) + '[^\\d\\n\\r]{0,30}(\\d{1,6})', 'i');
+    if (m1 && m1[1]) {
+      const val = normalizeNumberString(m1[1]);
+      if (val !== null) return val;
+    }
+    const re2 = new RegExp(escapeRegex(kw) + '[^\\d\\n\\r]{0,40}(\\d{1,6}[\\d\\.,\\u00A0\\u202F]*)', 'i');
     const m2 = normalized.match(re2);
-    if (m2 && m2[1]) return parseInt(m2[1], 10);
+    if (m2 && m2[1]) {
+      const val = normalizeNumberString(m2[1]);
+      if (val !== null) return val;
+    }
   }
-  // fallback: find lines containing a keyword then extract nearest number
+
+  // lines scanning
   const lines = normalized.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   for (let i = 0; i < lines.length; i++) {
-    for (const kw of keywords) {
+    for (const kw of (keywords || [])) {
       if (lines[i].toLowerCase().includes((kw || '').toLowerCase())) {
-        // search number in same line
-        const mm = lines[i].match(/(\d{1,6})/);
-        if (mm && mm[1]) return parseInt(mm[1], 10);
-        // prev/next lines
-        if (i > 0) { const mm2 = lines[i-1].match(/(\d{1,6})/); if (mm2 && mm2[1]) return parseInt(mm2[1],10); }
-        if (i+1 < lines.length) { const mm3 = lines[i+1].match(/(\d{1,6})/); if (mm3 && mm3[1]) return parseInt(mm3[1],10); }
+        // number same line
+        const mm = lines[i].match(/(\d{1,6}[\d\.,\u00A0\u202F]*)/);
+        if (mm && mm[1]) {
+          const val = normalizeNumberString(mm[1]);
+          if (val !== null) return val;
+        }
+        // prev line
+        if (i > 0) {
+          const mm2 = lines[i-1].match(/(\d{1,6}[\d\.,\u00A0\u202F]*)/);
+          if (mm2 && mm2[1]) {
+            const v = normalizeNumberString(mm2[1]);
+            if (v !== null) return v;
+          }
+        }
+        // next line
+        if (i + 1 < lines.length) {
+          const mm3 = lines[i+1].match(/(\d{1,6}[\d\.,\u00A0\u202F]*)/);
+          if (mm3 && mm3[1]) {
+            const v2 = normalizeNumberString(mm3[1]);
+            if (v2 !== null) return v2;
+          }
+        }
       }
     }
+  }
+
+  // last resort: pick largest numeric-looking token if > 1
+  const all = Array.from(normalized.matchAll(/(\d{1,6}[\d\.,\u00A0\u202F]*)/g)).map(m => normalizeNumberString(m[1])).filter(x => x !== null);
+  if (all.length) {
+    const max = Math.max(...all);
+    if (max > 1) return max;
   }
   return null;
 }
 
-// render with Playwright (if available), return page text or null
+// Playwright render: returns textual content of page (body.innerText) or null
 async function renderPageTextWithPlaywright(url, timeoutMs = 90000) {
   if (!playwrightChromium) return null;
   let browser = null;
   try {
     browser = await playwrightChromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-      viewport: { width: 1280, height: 900 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      viewport: { width: 1280, height: 900 }
     });
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ 'accept-language': 'de-DE,de;q=0.9' });
-    await page.goto(url, { waitUntil: 'networkidle', timeout: timeoutMs });
-    // small wait for JS-rendered text
-    await page.waitForTimeout(600);
+    await page.goto(url, { waitUntil: 'networkidle', timeout: timeoutMs }).catch(e => { /* ignore goto timeout */ });
+    // give some time for JS to settle
+    await page.waitForTimeout(500);
     const text = await page.evaluate(() => document.body ? document.body.innerText : '');
     await page.close();
     await context.close();
@@ -164,111 +219,172 @@ async function renderPageTextWithPlaywright(url, timeoutMs = 90000) {
     return text;
   } catch (e) {
     if (browser) {
-      try { await browser.close(); } catch(_) {}
+      try { await browser.close(); } catch (_) {}
     }
-    console.log('Playwright render error for', url, (e && e.message) ? e.message.split('\n')[0] : e);
+    console.log('Playwright render error for', url, e && e.message ? e.message.split('\n')[0] : e);
     return null;
   }
 }
 
-/* Main handler */
-app.get('/check-hofer', async (req, res) => {
-  const secret = process.env.SCRAPER_SECRET;
-  if (secret) {
-    const header = req.get('x-scraper-secret');
-    if (!header || header !== secret) return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  const overall = { timestamp: new Date().toISOString(), results: {} };
-
-  for (const c of COUNTRIES) {
-    const countrySummary = { datePlpsFound: 0, plps: [], unknowns: [] };
-    const listingUrl = new URL(c.listingPath || '/', c.base).toString();
-
-    try {
-      // 1) try fetch-based discovery
-      const listingHtml = await tryFetchHtml(listingUrl, 25000);
-      const pagesSet = new Set();
-
-      if (listingHtml) {
-        // anchors
-        const anchors = extractAnchorsFromHtml(listingHtml);
-        for (const a of anchors) normalizeAndCollect(a.href, c.base, pagesSet, [c.listingPath]);
-        // explicit date-PLP pattern
-        const rawPlps = extractDatePlpLinksFromHtml(listingHtml, c.base);
-        for (const p of rawPlps) pagesSet.add(p);
-      } else {
-        // fallback: include listing page itself so we run at least one check
-        pagesSet.add(listingUrl);
-      }
-
-      // ensure we have at least listing page
-      pagesSet.add(listingUrl);
-
-      const pagesArray = Array.from(pagesSet);
-
-      // 2) for each discovered page try to get count
-      for (const url of pagesArray) {
-        try {
-          // fetch-first
-          let pageText = await tryFetchHtml(url, 20000);
-          let foundCount = null;
-          if (pageText) {
-            foundCount = extractCountFromText(pageText, c.keywords);
-          }
-
-          // fallback to playwrigh if fetch couldn't extract
-          if (foundCount === null) {
-            const renderedText = await renderPageTextWithPlaywright(url, 90000);
-            if (renderedText) {
-              foundCount = extractCountFromText(renderedText, c.keywords);
-              // also attempt to capture snippet
-              const snippetMatch = (renderedText.match(new RegExp('.{0,80}' + escapeRegex((c.keywords[0]||'').slice(0,20)) + '.{0,80}', 'i')) || [''])[0];
-              countrySummary.plps.push({ url, count: foundCount, snippet: snippetMatch || null });
-            } else {
-              // no render, push as unknown if fetch didn't show
-              countrySummary.unknowns.push({ url, reason: 'no-render-and-no-count' });
-            }
-          } else {
-            const snippetMatch = (pageText.match(new RegExp('.{0,80}' + escapeRegex((c.keywords[0]||'').slice(0,20)) + '.{0,80}', 'i')) || [''])[0];
-            countrySummary.plps.push({ url, count: foundCount, snippet: snippetMatch || null });
-          }
-        } catch (e) {
-          countrySummary.unknowns.push({ url, reason: String(e) });
+// Use playwright page to try some selectors (returns first numeric found or null)
+async function extractCountUsingPlaywrightSelectors(url, timeoutMs = 90000, keywords = []) {
+  if (!playwrightChromium) return null;
+  let browser = null;
+  try {
+    browser = await playwrightChromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const context = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' });
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: 'networkidle', timeout: timeoutMs }).catch(() => {});
+    await page.waitForTimeout(300);
+    // candidate selectors - common header/title elements
+    const selectors = ['.page-title', 'h1', 'h2', '.results-count', '.product-count', '.headline__count', '.page-header', '.breadcrumbs'];
+    for (const sel of selectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const txt = await page.evaluate(e => e.innerText || e.textContent || '', el);
+        const c = extractCountFromTextImproved(txt, keywords);
+        if (c !== null) {
+          await page.close();
+          await context.close();
+          await browser.close();
+          return c;
         }
+      } catch (e) { /* ignore and continue */ }
+    }
+    // fallback: whole-body text
+    const whole = await page.evaluate(() => document.body ? document.body.innerText : '');
+    const c2 = extractCountFromTextImproved(whole, keywords);
+    await page.close();
+    await context.close();
+    await browser.close();
+    return c2;
+  } catch (e) {
+    if (browser) {
+      try { await browser.close(); } catch (_) {}
+    }
+    console.log('Playwright selector extraction error for', url, e && e.message ? e.message.split('\n')[0] : e);
+    return null;
+  }
+}
+
+/* ---------- Routes ---------- */
+
+app.get('/', (_req, res) => res.send('Hofer checker alive'));
+
+// main check endpoint
+app.get('/check-hofer', async (req, res) => {
+  try {
+    // optional secret
+    const secret = process.env.SCRAPER_SECRET;
+    if (secret) {
+      const header = req.get('x-scraper-secret');
+      if (!header || header !== secret) return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const overall = { timestamp: new Date().toISOString(), countries: {} };
+
+    for (const c of COUNTRIES) {
+      const countryResult = { datePlpsFound: 0, plps: [], unknowns: [] };
+      const listingUrl = new URL(c.listingPath || '/', c.base).toString();
+      try {
+        const listingHtml = await tryFetchHtml(listingUrl, 25000);
+        const pagesSet = new Set();
+
+        if (listingHtml) {
+          // anchors
+          const anchors = extractAnchorsFromHtml(listingHtml);
+          anchors.forEach(a => normalizeAndCollect(a.href, c.base, pagesSet, c.listingPath));
+          // explicit date PLPs
+          const datePlps = extractDatePlpLinksFromHtml(listingHtml, c.base);
+          datePlps.forEach(p => pagesSet.add(p));
+        } else {
+          pagesSet.add(listingUrl);
+        }
+
+        // always include listing page
+        pagesSet.add(listingUrl);
+
+        // probe each unique page
+        const pagesArray = Array.from(pagesSet);
+
+        for (const pageUrl of pagesArray) {
+          try {
+            const host = new URL(pageUrl).hostname;
+            const forceRender = ALWAYS_RENDER_DOMAINS.some(d => host.includes(d));
+            // fetch-first
+            let htmlText = await tryFetchHtml(pageUrl, 20000);
+            let count = null;
+            // attempt text extraction if we have html
+            if (htmlText) {
+              count = extractCountFromTextImproved(htmlText, KEYWORD_MAP[c.code] || []);
+            }
+            // if not found or forced, try Playwright selectors/render
+            if (count === null && (playwrightChromium || forceRender)) {
+              // prefer selector extraction if playwright available
+              const cFromSelectors = await extractCountUsingPlaywrightSelectors(pageUrl, 90000, KEYWORD_MAP[c.code] || []);
+              if (cFromSelectors !== null) {
+                count = cFromSelectors;
+              } else {
+                // fallback: render body text & try improved extractor
+                const rendered = await renderPageTextWithPlaywright(pageUrl, 90000);
+                if (rendered) {
+                  const c2 = extractCountFromTextImproved(rendered, KEYWORD_MAP[c.code] || []);
+                  if (c2 !== null) count = c2;
+                }
+              }
+            }
+
+            // normalization - if count is exactly 0/nan etc, keep null to mark unknown
+            if (typeof count === 'number' && !Number.isFinite(count)) count = null;
+
+            // push result
+            countryResult.plps.push({ url: pageUrl, count: count === null ? 'unknown' : count });
+
+          } catch (inner) {
+            countryResult.unknowns.push({ url: pageUrl, reason: String(inner) });
+          }
+        }
+
+        // count datePLPs (pattern /d.XX-XX-XXXX.html)
+        countryResult.datePlpsFound = countryResult.plps.filter(p => /\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(p.url)).length;
+
+      } catch (errCountry) {
+        countryResult.error = String(errCountry);
       }
 
-      // filter only actual PLP pages (with counts or ones matching pattern)
-      // count date-specific PLPs found (ones matching /d.XX-XX-XXXX.html)
-      const datePlps = countrySummary.plps.filter(p => /\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(p.url));
-      countrySummary.datePlpsFound = datePlps.length;
-
-      // sort plps: date PLPs first
-      countrySummary.plps = [
-        ...datePlps.sort((a,b) => (b.count||0)-(a.count||0)),
-        ...countrySummary.plps.filter(p => !/\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(p.url))
-      ];
-
-    } catch (outer) {
-      countrySummary.error = String(outer);
+      overall.countries[c.code] = countryResult;
     }
 
-    overall.results[c.code] = countrySummary;
-  } // end countries loop
+    // prepare minimal plain text if requested
+    const wantText = (req.query.format && req.query.format.toLowerCase() === 'txt') ||
+                     (req.get('accept') && req.get('accept').toLowerCase().includes('text/plain'));
 
-  // Build minimal human-friendly output as requested
-  const minimal = { timestamp: overall.timestamp, countries: {} };
-  for (const [code, cs] of Object.entries(overall.results)) {
-    const summary = { datePlpsFound: cs.datePlpsFound || 0, plps: [] };
-    for (const p of cs.plps) {
-      summary.plps.push({ url: p.url, count: p.count === null ? 'unknown' : p.count });
+    // minimal summary structure for both outputs
+    if (wantText) {
+      const lines = [];
+      for (const [code, cs] of Object.entries(overall.countries)) {
+        lines.push(code);
+        lines.push(`Date PLPs found - ${cs.datePlpsFound || 0}`);
+        // list date PLPs first
+        const datePlps = (cs.plps || []).filter(p => /\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(p.url));
+        for (const p of datePlps) lines.push(`${p.url} - Product found ${p.count}`);
+        // then others (optional)
+        const otherPlps = (cs.plps || []).filter(p => !/\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(p.url));
+        for (const p of otherPlps) lines.push(`${p.url} - Product found ${p.count}`);
+        lines.push('');
+      }
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.send(lines.join('\n'));
     }
-    if (cs.unknowns && cs.unknowns.length) summary.unknowns = cs.unknowns;
-    if (cs.error) summary.error = cs.error;
-    minimal.countries[code] = summary;
+
+    // default JSON response
+    return res.json(overall);
+
+  } catch (e) {
+    console.error('Fatal /check-hofer error:', e && e.stack ? e.stack : e);
+    return res.status(500).json({ error: String(e) });
   }
-
-  return res.json(minimal);
 });
 
 app.listen(PORT, () => console.log(`Hofer multi-checker listening on port ${PORT}`));
