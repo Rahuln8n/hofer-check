@@ -1,13 +1,14 @@
 /**
- * Hofer-checker service
+ * Hofer-checker service (updated)
  * - Express server
  * - GET / -> health
  * - GET /check-hofer -> scraper (fetch-first then Playwright fallback)
+ * - Improved discovery: explicitly finds date-specific PLP links like /d.08-12-2025.html
  *
  * Notes:
  * - Protect endpoint by setting SCRAPER_SECRET env var in Render and sending header
  *   x-scraper-secret: <secret>
- * - The handler may take up to ~60-120s on free Render instances (cold start + Playwright).
+ * - The handler may take up to ~60-120s on free Render instances.
  */
 
 const express = require('express');
@@ -23,7 +24,6 @@ app.get('/', (_req, res) => {
 
 /**
  * Helper: try to fetch HTML using global fetch (Node 18+). If no global fetch or fetch fails, return null.
- * This is faster and less resource-heavy than launching a browser.
  */
 async function tryFetchHtml(url) {
   try {
@@ -72,6 +72,26 @@ function normalizeAndCollect(href, base, set) {
   }
 }
 
+/** Find date-PLP links directly in raw HTML (in case anchors are not fully parsed) */
+function extractDatePlpLinksFromHtml(html, base) {
+  const set = new Set();
+  if (!html) return set;
+  try {
+    const re = /(?:href=)?["']?([^"'\s>]*\/d\.\d{2}-\d{2}-\d{4}\.html)["']?/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const href = m[1];
+      if (!href) continue;
+      // normalize relative -> absolute
+      const abs = href.startsWith('http') ? href : new URL(href, base).toString();
+      set.add(abs.split('#')[0].split('?')[0]);
+    }
+  } catch (e) {
+    // ignore
+  }
+  return set;
+}
+
 /** Main handler */
 app.get('/check-hofer', async (req, res) => {
   const secret = process.env.SCRAPER_SECRET;
@@ -89,11 +109,16 @@ app.get('/check-hofer', async (req, res) => {
   try {
     // 1) Try fetch-based discovery first (fast)
     console.log('Starting fetch-based discovery for', base);
-    const homepageHtml = await tryFetchHtml(base);
+    const homepageHtml = await tryFetchHtml(base + '/de/angebote');
     if (homepageHtml) {
       console.log('Homepage fetch succeeded, length=', homepageHtml.length);
+      // anchors from HTML
       const anchors = extractAnchorsFromHtml(homepageHtml);
       for (const a of anchors) normalizeAndCollect(a.href, base, pagesToCheck);
+      // also search raw HTML for explicit date-PLP links like /d.08-12-2025.html
+      const plpSet = extractDatePlpLinksFromHtml(homepageHtml, base);
+      for (const p of plpSet) pagesToCheck.add(p);
+      console.log('Discovered via fetch: anchors=', anchors.length, 'plpLinks=', plpSet.size);
     } else {
       console.log('Homepage fetch not usable; will attempt Playwright discovery');
     }
@@ -118,15 +143,18 @@ app.get('/check-hofer', async (req, res) => {
           await page.setExtraHTTPHeaders({ 'accept-language': 'de-DE,de;q=0.9' });
           const navTimeout = 60000 * attempt; // 60s, 120s, 180s
           console.log('Playwright navigating to homepage with timeout', navTimeout);
-          await page.goto(base, { waitUntil: 'domcontentloaded', timeout: navTimeout });
+          await page.goto(base + '/de/angebote', { waitUntil: 'domcontentloaded', timeout: navTimeout });
           await page.waitForTimeout(1200);
           const discoveryHtml = await page.content();
           await page.close();
           await context.close();
           await browser.close();
           browser = null;
+          // anchors and explicit PLP links
           const anchors2 = extractAnchorsFromHtml(discoveryHtml || '');
           for (const a of anchors2) normalizeAndCollect(a.href, base, pagesToCheck);
+          const plpSet2 = extractDatePlpLinksFromHtml(discoveryHtml || '', base);
+          for (const p of plpSet2) pagesToCheck.add(p);
           if (pagesToCheck.size > 1) { // discovered something besides main listing
             console.log('Discovery found anchors, count=', pagesToCheck.size);
             break;
@@ -251,6 +279,7 @@ app.get('/check-hofer', async (req, res) => {
       unknownPages,
       all: results
     });
+
   } catch (err) {
     console.log('Top-level handler error:', String(err).slice(0,400));
     return res.status(500).json({ error: String(err) });
