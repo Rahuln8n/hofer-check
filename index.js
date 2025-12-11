@@ -1,114 +1,123 @@
 /**
  * Hofer-checker service
  * - Express server
- * - / -> health
- * - /check-hofer -> scraper (fetch-first then Playwright fallback)
+ * - GET / -> health
+ * - GET /check-hofer -> scraper (fetch-first then Playwright fallback)
+ *
+ * Notes:
+ * - Protect endpoint by setting SCRAPER_SECRET env var in Render and sending header
+ *   x-scraper-secret: <secret>
+ * - The handler may take up to ~60-120s on free Render instances (cold start + Playwright).
  */
+
 const express = require('express');
 const { chromium } = require('playwright');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// basic health endpoint
-app.get('/', (req, res) => {
+// Health
+app.get('/', (_req, res) => {
   res.send('Hofer checker alive');
 });
 
 /**
- * /check-hofer handler
- * - uses a fetch-first strategy to be faster and avoid Playwright when possible
- * - falls back to Playwright with retries and longer timeouts if needed
+ * Helper: try to fetch HTML using global fetch (Node 18+). If no global fetch or fetch fails, return null.
+ * This is faster and less resource-heavy than launching a browser.
  */
-app.get('/check-hofer', async (req, res) => {
+async function tryFetchHtml(url) {
   try {
-    const secret = process.env.SCRAPER_SECRET;
-    if (secret) {
-      const header = req.get('x-scraper-secret');
-      if (!header || header !== secret) {
-        return res.status(401).json({ error: 'unauthorized' });
-      }
-    }
-
-    const base = 'https://hofer.at';
-    const results = [];
-
-    // fetch helper (Node 18+ has global fetch)
-    async function tryFetch(url) {
-      try {
-        if (global.fetch) {
-          const r = await fetch(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-              'Accept-Language': 'de-DE,de;q=0.9'
-            },
-            // no explicit timeout here
-          });
-          if (!r || !r.ok) return null;
-          return await r.text();
-        } else {
-          // If no global fetch (rare in Playwright image), return null so we fallback to Playwright
-          return null;
+    if (typeof fetch === 'function') {
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+          'Accept-Language': 'de-DE,de;q=0.9'
         }
-      } catch (e) {
-        console.log('fetch error:', String(e).slice(0,200));
-        return null;
-      }
+      });
+      if (!r || !r.ok) return null;
+      return await r.text();
     }
+  } catch (e) {
+    console.log('fetch failed:', String(e).slice(0,300));
+    return null;
+  }
+  return null;
+}
 
-    function extractAnchorsFromHtml(html) {
-      const hrefs = [];
-      try {
-        const re = /<a\s+[^>]*href=(["'])(.*?)\1[^>]*>(.*?)<\/a>/gi;
-        let m;
-        while ((m = re.exec(html)) !== null) {
-          hrefs.push({ href: m[2], text: (m[3] || '').replace(/<[^>]*>/g, '').trim() });
-        }
-      } catch (e) {}
-      return hrefs;
+/** Extract anchors quickly from HTML string (simple regex; good enough for discovery) */
+function extractAnchorsFromHtml(html) {
+  const hrefs = [];
+  if (!html) return hrefs;
+  try {
+    const re = /<a\s+[^>]*href=(["'])(.*?)\1[^>]*>(.*?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      hrefs.push({ href: m[2], text: (m[3] || '').replace(/<[^>]*>/g, '').trim() });
     }
+  } catch (e) {
+    // ignore parse errors
+  }
+  return hrefs;
+}
 
-    // 1) Try fetch homepage for link discovery
-    let homepageHtml = await tryFetch(base);
-    if (homepageHtml) console.log('fetch homepage ok length=', homepageHtml.length);
-    else console.log('fetch homepage not available, will use Playwright discovery if needed');
+/** Normalize and collect only internal Angebote links */
+function normalizeAndCollect(href, base, set) {
+  if (!href) return;
+  if (href.startsWith('javascript:')) return;
+  const isInternal = href.startsWith('/') || href.includes('hofer.at');
+  const looksLikeAngebote = href.toLowerCase().includes('/angebote') || /\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(href);
+  if (isInternal && looksLikeAngebote) {
+    const abs = href.startsWith('http') ? href : new URL(href, base).toString();
+    set.add(abs.split('#')[0].split('?')[0]);
+  }
+}
 
-    const pagesToCheck = new Set();
-
-    function normalizeAndCollect(aHref) {
-      if (!aHref) return;
-      if (aHref.startsWith('javascript:')) return;
-      const isInternal = aHref.startsWith('/') || aHref.includes('hofer.at');
-      const looksLikeAngebote = aHref.toLowerCase().includes('/angebote') || /\/d\.\d{2}-\d{2}-\d{4}\.html/i.test(aHref);
-      if (isInternal && looksLikeAngebote) {
-        const abs = aHref.startsWith('http') ? aHref : new URL(aHref, base).toString();
-        pagesToCheck.add(abs.split('#')[0].split('?')[0]);
-      }
+/** Main handler */
+app.get('/check-hofer', async (req, res) => {
+  const secret = process.env.SCRAPER_SECRET;
+  if (secret) {
+    const header = req.get('x-scraper-secret');
+    if (!header || header !== secret) {
+      return res.status(401).json({ error: 'unauthorized' });
     }
+  }
 
+  const base = 'https://hofer.at';
+  const results = [];
+  const pagesToCheck = new Set();
+
+  try {
+    // 1) Try fetch-based discovery first (fast)
+    console.log('Starting fetch-based discovery for', base);
+    const homepageHtml = await tryFetchHtml(base);
     if (homepageHtml) {
+      console.log('Homepage fetch succeeded, length=', homepageHtml.length);
       const anchors = extractAnchorsFromHtml(homepageHtml);
-      for (const a of anchors) normalizeAndCollect(a.href);
+      for (const a of anchors) normalizeAndCollect(a.href, base, pagesToCheck);
+    } else {
+      console.log('Homepage fetch not usable; will attempt Playwright discovery');
     }
 
-    // If no anchors, do Playwright discovery with retries
-    let browser = null;
-    if (pagesToCheck.size === 0) {
-      console.log('no anchors from fetch -> running Playwright discovery');
+    // Always include main listing page as fallback
+    pagesToCheck.add(`${base}/de/angebote`);
+
+    // 2) If no anchors from fetch, do Playwright discovery with retries
+    if (pagesToCheck.size <= 1) { // only main listing present
+      console.log('No anchors found by fetch, running Playwright discovery');
+      let browser = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          browser = await chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-          });
+          console.log('Discovery attempt', attempt);
+          browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
           const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-            viewport: { width: 1280, height: 900 }, locale: 'de-DE'
+            viewport: { width: 1280, height: 900 },
+            locale: 'de-DE'
           });
           const page = await context.newPage();
           await page.setExtraHTTPHeaders({ 'accept-language': 'de-DE,de;q=0.9' });
-          const navTimeout = 60000 * attempt; // 60s,120s,180s
-          console.log('discovery goto', base, 'timeout', navTimeout);
+          const navTimeout = 60000 * attempt; // 60s, 120s, 180s
+          console.log('Playwright navigating to homepage with timeout', navTimeout);
           await page.goto(base, { waitUntil: 'domcontentloaded', timeout: navTimeout });
           await page.waitForTimeout(1200);
           const discoveryHtml = await page.content();
@@ -117,28 +126,32 @@ app.get('/check-hofer', async (req, res) => {
           await browser.close();
           browser = null;
           const anchors2 = extractAnchorsFromHtml(discoveryHtml || '');
-          for (const a of anchors2) normalizeAndCollect(a.href);
-          if (pagesToCheck.size > 0) break;
+          for (const a of anchors2) normalizeAndCollect(a.href, base, pagesToCheck);
+          if (pagesToCheck.size > 1) { // discovered something besides main listing
+            console.log('Discovery found anchors, count=', pagesToCheck.size);
+            break;
+          }
         } catch (err) {
-          console.log('discovery attempt error', attempt, String(err).slice(0,200));
+          console.log('Discovery attempt error:', String(err).slice(0,300));
           if (browser) { try { await browser.close(); } catch(e){}; browser = null; }
+          // small backoff
           await new Promise(r => setTimeout(r, 1000 * attempt));
         }
       }
     }
 
-    // ensure main listing included
-    pagesToCheck.add(`${base}/de/angebote`);
     const pagesArray = Array.from(pagesToCheck);
-    console.log('pages to check:', pagesArray.length);
+    console.log('Final pages to check count=', pagesArray.length);
 
-    // For each page: try fetch first, then Playwright fallback
+    // 3) For each page: try fetch first; if not sufficient, fallback to Playwright with improved waits
     for (const url of pagesArray) {
-      console.log('processing', url);
+      console.log('Processing', url);
       try {
-        let bodyText = await tryFetch(url);
+        // Fetch-first
+        let bodyText = await tryFetchHtml(url);
         if (bodyText && /Aktionsartikel/i.test(bodyText)) {
-          // parse number from fetched HTML
+          console.log('Found Aktionsartikel via fetch for', url);
+          // parse number
           let count = null;
           const m = bodyText.match(/(\d{1,6})\s+Aktionsartikel\s+gefunden/i);
           if (m && m[1]) count = parseInt(m[1], 10);
@@ -146,58 +159,88 @@ app.get('/check-hofer', async (req, res) => {
             const m2 = bodyText.match(/(\d{1,6})[^0-9\n\r]{0,20}Aktionsartikel/i);
             if (m2 && m2[1]) count = parseInt(m2[1], 10);
           }
-          results.push({ url, count, snippet: (bodyText.match(/.{0,80}Aktionsartikel.{0,80}/i) || [''])[0] });
+          results.push({ url, count, snippet: (bodyText.match(/.{0,120}Aktionsartikel.{0,120}/i) || [''])[0] });
           continue;
         }
 
-        // Playwright fallback for this page (2 attempts)
+        // Playwright fallback (2 attempts)
         let pageResult = null;
         for (let attempt = 1; attempt <= 2; attempt++) {
+          let browser = null;
           try {
-            browser = await chromium.launch({
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox']
-            });
+            console.log(`Playwright rendering ${url} (attempt ${attempt})`);
+            browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
             const context = await browser.newContext({
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-              viewport: { width: 1280, height: 900 }, locale: 'de-DE'
+              viewport: { width: 1280, height: 900 },
+              locale: 'de-DE'
             });
-            context.setDefaultNavigationTimeout(120000);
             const p = await context.newPage();
             await p.setExtraHTTPHeaders({ 'accept-language': 'de-DE,de;q=0.9' });
-            await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
-            await p.waitForTimeout(900);
+            // Wait until network idle so client JS can render; generous timeout
+            await p.goto(url, { waitUntil: 'networkidle', timeout: 120000 });
+            // Wait briefly for dynamic rendering
+            try {
+              await p.waitForFunction(() => /Aktionsartikel/i.test(document.body.innerText), { timeout: 8000 });
+              console.log('Aktionsartikel text appeared in DOM for', url);
+            } catch (e) {
+              console.log('Aktionsartikel not detected within 8s on', url);
+            }
+            await p.waitForTimeout(700);
             const bt = await p.evaluate(() => document.body.innerText || '');
+
+            // Try exact patterns
             let count = null;
             const m = bt.match(/(\d{1,6})\s+Aktionsartikel\s+gefunden/i);
             if (m && m[1]) count = parseInt(m[1], 10);
+
             if (count === null) {
               const m2 = bt.match(/(\d{1,6})[^0-9\n\r]{0,20}Aktionsartikel/i);
               if (m2 && m2[1]) count = parseInt(m2[1], 10);
             }
-            pageResult = { url, count, snippet: (bt.match(/.{0,80}Aktionsartikel.{0,80}/i) || [''])[0] };
+
+            // fallback: look for lines near 'Aktionsartikel' for digits
+            if (count === null) {
+              const lines = bt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+              for (let i = 0; i < lines.length; i++) {
+                if (/Aktionsartikel/i.test(lines[i])) {
+                  // same line
+                  const mm = lines[i].match(/(\d{1,6})/);
+                  if (mm && mm[1]) { count = parseInt(mm[1], 10); break; }
+                  // prev line
+                  if (i > 0) { const mm2 = lines[i-1].match(/(\d{1,6})/); if (mm2 && mm2[1]) { count = parseInt(mm2[1],10); break; } }
+                  // next line
+                  if (i+1 < lines.length) { const mm3 = lines[i+1].match(/(\d{1,6})/); if (mm3 && mm3[1]) { count = parseInt(mm3[1],10); break; } }
+                }
+              }
+            }
+
+            pageResult = { url, count, snippet: (bt.match(/.{0,120}Aktionsartikel.{0,120}/i) || [''])[0] };
             await p.close();
             await context.close();
             await browser.close();
             browser = null;
             break;
-          } catch (err) {
-            console.log(`playwright page error ${url} attempt ${attempt}:`, String(err).slice(0,300));
+          } catch (innerErr) {
+            console.log('Playwright page error:', String(innerErr).slice(0,400));
             if (browser) { try { await browser.close(); } catch(e){}; browser = null; }
             await new Promise(r => setTimeout(r, 1000 * attempt));
           }
+        } // attempts
+
+        if (pageResult) {
+          results.push(pageResult);
+        } else {
+          results.push({ url, error: 'failed to fetch or render page' });
         }
-        if (pageResult) results.push(pageResult);
-        else results.push({ url, error: 'failed to fetch or render page' });
-      } catch (outerErr) {
-        console.log('outer error for', url, String(outerErr).slice(0,200));
-        results.push({ url, error: String(outerErr) });
-        if (browser) { try { await browser.close(); } catch(e){}; browser = null; }
+
+      } catch (pageOuterErr) {
+        console.log('outer error for url', url, String(pageOuterErr).slice(0,300));
+        results.push({ url, error: String(pageOuterErr) });
       }
-    } // end loop
+    } // for each page
 
-    if (browser) { try { await browser.close(); } catch(e){}; browser = null; }
-
+    // Finalize
     const zeroPages = results.filter(r => r.count === 0);
     const unknownPages = results.filter(r => r.count === null && !r.error);
 
@@ -209,12 +252,12 @@ app.get('/check-hofer', async (req, res) => {
       all: results
     });
   } catch (err) {
-    console.log('handler top-level error', String(err).slice(0,500));
+    console.log('Top-level handler error:', String(err).slice(0,400));
     return res.status(500).json({ error: String(err) });
   }
 });
 
-// start server
+// Start server
 app.listen(PORT, () => {
   console.log(`Hofer-checker listening on port ${PORT}`);
 });
